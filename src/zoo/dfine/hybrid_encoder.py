@@ -176,7 +176,11 @@ class ELAN(nn.Module):
     def forward(self, x):
         # y = [self.cv1(x)]
         y = list(self.cv1(x).chunk(2, 1))
-        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        # Avoid generator-based list mutation which can confuse torch.compile, ig
+        t = self.cv2(y[-1])
+        y.append(t)
+        t = self.cv3(y[-1])
+        y.append(t)
         return self.cv4(torch.cat(y, 1))
 
 
@@ -198,12 +202,20 @@ class RepNCSPELAN4(nn.Module):
 
     def forward_chunk(self, x):
         y = list(self.cv1(x).chunk(2, 1))
-        y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
+        # Avoid generator-based list mutation for compile friendliness
+        t = self.cv2(y[-1])
+        y.append(t)
+        t = self.cv3(y[-1])
+        y.append(t)
         return self.cv4(torch.cat(y, 1))
 
     def forward(self, x):
         y = list(self.cv1(x).split((self.c, self.c), 1))
-        y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
+        # Avoid generator-based list mutation for compile friendliness
+        t = self.cv2(y[-1])
+        y.append(t)
+        t = self.cv3(y[-1])
+        y.append(t)
         return self.cv4(torch.cat(y, 1))
 
 
