@@ -7,7 +7,14 @@ import importlib.metadata
 
 from torch import Tensor
 
-if "0.15.2" in importlib.metadata.version("torchvision"):
+try:
+    _tv_version = importlib.metadata.version("torchvision")
+except importlib.metadata.PackageNotFoundError:
+    import torchvision
+
+    _tv_version = torchvision.__version__
+
+if "0.15.2" in _tv_version:
     import torchvision
 
     torchvision.disable_beta_transforms_warning()
@@ -18,7 +25,7 @@ if "0.15.2" in importlib.metadata.version("torchvision"):
 
     _boxes_keys = ["format", "spatial_size"]
 
-elif "0.17" > importlib.metadata.version("torchvision") >= "0.16":
+elif "0.17" > _tv_version >= "0.16":
     import torchvision
 
     torchvision.disable_beta_transforms_warning()
@@ -28,7 +35,7 @@ elif "0.17" > importlib.metadata.version("torchvision") >= "0.16":
 
     _boxes_keys = ["format", "canvas_size"]
 
-elif importlib.metadata.version("torchvision") >= "0.17":
+elif _tv_version >= "0.17":
     import torchvision
     from torchvision.transforms.v2 import SanitizeBoundingBoxes
     from torchvision.tv_tensors import BoundingBoxes, BoundingBoxFormat, Image, Mask, Video

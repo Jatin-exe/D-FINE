@@ -147,6 +147,36 @@ conda activate dfine
 pip install -r requirements.txt
 ```
 
+### TTNN quickstart (Laser)
+
+The TTNN path runs the backbone/encoder/decoder on device and uses pre-exported TTNN weights.
+The default scripts set all required env vars internally, so you can run them directly.
+
+```bash
+# Install Python deps (torch/torchvision + runtime extras)
+./tools/setup_ttnn_env.sh
+
+# TTNN-only evaluation (COCO-style metrics via ttnn_eval.py)
+./tools/inference/run_laser_ttnn_only.sh
+
+# Torch vs TTNN parity (F1/latency summary)
+./tools/inference/run_laser_ttnn_eval.sh
+
+# Torch-only baseline (for reference)
+./tools/inference/run_laser_torch_eval.sh
+```
+
+Notes:
+- `tools/setup_ttnn_env.sh` downloads the dataset and checkpoints and exports TTNN weights if missing.
+- You can override paths with:
+  - `LASER_DATA_ROOT` (dataset root)
+  - `LASER_CHECKPOINT` (checkpoint path)
+  - `LASER_CONFIG` (model config)
+  - `LASER_NUM_CLASSES` (class count)
+  - `TTNN_WEIGHT_DIR` (TTNN weight store)
+- The evaluation harness uses torch for dataset loading and postprocessing. The model ops themselves are TTNN-only.
+- `run_laser_ttnn_only.sh` defaults to a 10-sample sanity run. Set `FULL_DATASET=1` to evaluate the full split.
+
 
 ### Data Preparation
 

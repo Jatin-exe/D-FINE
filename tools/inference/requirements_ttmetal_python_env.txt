@@ -1,0 +1,8 @@
+torch==2.7.1+cpu
+torchvision==0.22.1+cpu
+tensorboard
+faster-coco-eval
+calflops
+pandas
+seaborn
+graphviz
