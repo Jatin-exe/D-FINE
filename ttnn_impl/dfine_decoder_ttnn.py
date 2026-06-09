@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional, Sequence, Tuple
 from dataclasses import dataclass
+import os
 import time
 
 import torch
@@ -42,6 +43,9 @@ def _softmax_lastdim_ttnn(ttnn_mod, x_tt, dim: int = -1, pad_tensor=None, trace_
 class _DecoderTraceContext:
     softmax_pad: Optional["ttnn.Tensor"] = None
     lqe_pad: Optional["ttnn.Tensor"] = None
+    topk_score_pad: Optional["ttnn.Tensor"] = None
+    topk_mask_rng: Optional["ttnn.Tensor"] = None
+    topk_tie_break: Optional["ttnn.Tensor"] = None
 
 
 def _load_tensor_from_store(weight_store, key: str, device, dtype, layout):
@@ -186,11 +190,18 @@ def _ttnn_distance2bbox(ttnn_mod, points_tt, distance_tt, reg_scale: float, trac
     r = _ensure_tile(ttnn_mod.slice(distance_tt, [0, 0, 2], [B, L, 3]))
     b = _ensure_tile(ttnn_mod.slice(distance_tt, [0, 0, 3], [B, L, 4]))
 
-    half = ttnn_mod.full_like(x, 0.5 * reg_scale)
     reg_inv = 1.0 / reg_scale
     w_scale = ttnn_mod.multiply(w, reg_inv)
     h_scale = ttnn_mod.multiply(h, reg_inv)
 
+    if os.environ.get("TTNN_DISTANCE2BBOX_DIRECT", "0") != "0":
+        cx = ttnn_mod.add(x, ttnn_mod.multiply(ttnn_mod.subtract(r, l), ttnn_mod.multiply(w_scale, 0.5)))
+        cy = ttnn_mod.add(y, ttnn_mod.multiply(ttnn_mod.subtract(b, t), ttnn_mod.multiply(h_scale, 0.5)))
+        bw = ttnn_mod.multiply(ttnn_mod.add(ttnn_mod.add(l, r), reg_scale), w_scale)
+        bh = ttnn_mod.multiply(ttnn_mod.add(ttnn_mod.add(t, b), reg_scale), h_scale)
+        return ttnn_mod.concat([cx, cy, bw, bh], dim=-1)
+
+    half = ttnn_mod.full_like(x, 0.5 * reg_scale)
     x1 = ttnn_mod.subtract(x, ttnn_mod.multiply(ttnn_mod.add(half, l), w_scale))
     y1 = ttnn_mod.subtract(y, ttnn_mod.multiply(ttnn_mod.add(half, t), h_scale))
     x2 = ttnn_mod.add(x, ttnn_mod.multiply(ttnn_mod.add(half, r), w_scale))
@@ -506,6 +517,7 @@ class DFINETransformerTTNN(nn.Module):
         self.trace_ctx: Optional[_DecoderTraceContext] = None
         self.trace_mode = False
         self._last_timing_entries = None
+        self._topk_timing_entries = None
         if getattr(self.decoder_pt, "eval_spatial_size", None) is not None:
             eval_h, eval_w = self.decoder_pt.eval_spatial_size
             self._spatial_shapes_cache = [
@@ -513,11 +525,28 @@ class DFINETransformerTTNN(nn.Module):
             ]
             self.anchors_tt, self.valid_mask_tt = self._generate_anchors_ttnn(self._spatial_shapes_cache)
 
+    def _num_queries(self) -> int:
+        base_num_queries = int(self.decoder_pt.num_queries)
+        if os.environ.get("TTNN_DECODER_ALLOW_EXTRA_QUERIES", "0") != "0":
+            max_queries = int(os.environ.get("TTNN_DECODER_MAX_QUERIES", base_num_queries))
+        else:
+            max_queries = base_num_queries
+        level_quotas = os.environ.get("TTNN_TOPK_LEVEL_QUOTAS")
+        if level_quotas:
+            try:
+                quota_total = sum(max(0, int(part.strip())) for part in level_quotas.split(",") if part.strip())
+            except ValueError as exc:
+                raise ValueError(f"Invalid TTNN_TOPK_LEVEL_QUOTAS={level_quotas!r}") from exc
+            if quota_total > 0:
+                return min(quota_total, max_queries)
+        num_queries = int(os.environ.get("TTNN_DECODER_NUM_QUERIES", base_num_queries))
+        return max(1, min(num_queries, max_queries))
+
     def prepare_trace(self, batch: int = 1) -> None:
         if self._spatial_shapes_cache is None:
             raise RuntimeError("Trace requires eval_spatial_size to be set.")
         B = int(batch)
-        K = int(self.decoder_pt.num_queries)
+        K = self._num_queries()
         ttnn = self.ttnn
 
         # Softmax padding (regression bins)
@@ -535,9 +564,50 @@ class DFINETransformerTTNN(nn.Module):
         if pad_n:
             lqe_pad = ttnn.zeros((pad_n, R), device=self.device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
 
+        topk_score_pad = None
+        topk_mask_rng = None
+        topk_tie_break = None
+        L = sum(int(h) * int(w) for h, w in self._spatial_shapes_cache)
+        use_multipass_topk = os.environ.get("TTNN_TOPK_MULTIPASS64", "0") != "0" and K > 64
+        if os.environ.get("TTNN_TOPK_PAD_POWER2", "0") != "0" or use_multipass_topk:
+            padded_l = 1 << (L - 1).bit_length()
+            pad_width = padded_l - L
+            if pad_width > 0:
+                topk_score_pad = ttnn.full(
+                    (B, pad_width),
+                    -1.0e9,
+                    device=self.device,
+                    dtype=self.dtype,
+                    layout=ttnn.TILE_LAYOUT,
+                )
+            if use_multipass_topk:
+                pass_k = min(64, K)
+                topk_mask_rng = ttnn.arange(0, padded_l, 1, device=self.device, dtype=ttnn.uint32)
+                topk_mask_rng = ttnn.reshape(topk_mask_rng, (1, 1, 1, padded_l))
+                topk_mask_rng = ttnn.repeat(topk_mask_rng, (1, B, pass_k, 1))
+                if topk_mask_rng.get_layout() != ttnn.TILE_LAYOUT:
+                    topk_mask_rng = ttnn.to_layout(topk_mask_rng, ttnn.TILE_LAYOUT)
+        else:
+            padded_l = L
+
+        tie_break_eps = float(os.environ.get("TTNN_TOPK_TIE_BREAK_EPS", "0") or "0")
+        if tie_break_eps != 0.0:
+            topk_tie_break = ttnn.arange(0, padded_l, 1, device=self.device, dtype=ttnn.float32)
+            topk_tie_break = ttnn.reshape(topk_tie_break, (1, padded_l))
+            if B != 1:
+                topk_tie_break = ttnn.repeat(topk_tie_break, (B, 1))
+            topk_tie_break = ttnn.multiply(topk_tie_break, tie_break_eps / max(1, padded_l - 1))
+            if topk_tie_break.dtype != self.dtype:
+                topk_tie_break = ttnn.typecast(topk_tie_break, self.dtype)
+            if topk_tie_break.get_layout() != ttnn.TILE_LAYOUT:
+                topk_tie_break = ttnn.to_layout(topk_tie_break, ttnn.TILE_LAYOUT)
+
         self.trace_ctx = _DecoderTraceContext(
             softmax_pad=softmax_pad,
             lqe_pad=lqe_pad,
+            topk_score_pad=topk_score_pad,
+            topk_mask_rng=topk_mask_rng,
+            topk_tie_break=topk_tie_break,
         )
         self.integral.trace_ctx = self.trace_ctx
         if self.lqe_layer_tt is not None:
@@ -751,12 +821,124 @@ class DFINETransformerTTNN(nn.Module):
         one_hot = ttnn.typecast(one_hot, out_dtype)
         return ttnn.reshape(one_hot, (batch, k, length))
 
+    def _anchors_from_indices_ttnn(
+        self,
+        idx_tt,
+        spatial_shapes: List[List[int]],
+        batch: int,
+        k: int,
+    ) -> "ttnn.Tensor":
+        """Recreate encoder anchors from top-k indices without a sequence gather."""
+        ttnn = self.ttnn
+        if idx_tt.get_layout() != ttnn.TILE_LAYOUT:
+            idx_tt = ttnn.to_layout(idx_tt, ttnn.TILE_LAYOUT)
+        idx_f = idx_tt if idx_tt.dtype == ttnn.float32 else ttnn.typecast(idx_tt, ttnn.float32)
+
+        zero = ttnn.multiply(idx_f, 0.0)
+        if os.environ.get("TTNN_TOPK_ANCHOR_FAST", "1") != "0":
+            start_acc = zero
+            w_acc = zero
+            h_acc = zero
+            wh_acc = zero
+            start = 0
+            grid_size = 0.05
+            for lvl, (h, w) in enumerate(spatial_shapes):
+                h = int(h)
+                w = int(w)
+                end = start + h * w
+                in_level = ttnn.logical_and(ttnn.ge(idx_f, float(start)), ttnn.lt(idx_f, float(end)))
+                start_acc = ttnn.where(in_level, ttnn.add(zero, float(start)), start_acc)
+                w_acc = ttnn.where(in_level, ttnn.add(zero, float(w)), w_acc)
+                h_acc = ttnn.where(in_level, ttnn.add(zero, float(h)), h_acc)
+                wh_acc = ttnn.where(in_level, ttnn.add(zero, float(grid_size * (2.0 ** lvl))), wh_acc)
+                start = end
+            local = ttnn.subtract(idx_f, start_acc)
+            row = ttnn.floor(ttnn.div(local, w_acc))
+            col = ttnn.subtract(local, ttnn.multiply(row, w_acc))
+            x_acc = ttnn.div(ttnn.add(col, 0.5), w_acc)
+            y_acc = ttnn.div(ttnn.add(row, 0.5), h_acc)
+            w_acc = wh_acc
+            h_acc = wh_acc
+        else:
+            x_acc = zero
+            y_acc = zero
+            w_acc = zero
+            h_acc = zero
+            start = 0
+            grid_size = 0.05
+
+            for lvl, (h, w) in enumerate(spatial_shapes):
+                h = int(h)
+                w = int(w)
+                end = start + h * w
+                in_level = ttnn.logical_and(ttnn.ge(idx_f, float(start)), ttnn.lt(idx_f, float(end)))
+                local = ttnn.subtract(idx_f, float(start))
+                row = ttnn.floor(ttnn.div(local, float(w)))
+                col = ttnn.subtract(local, ttnn.multiply(row, float(w)))
+                x_norm = ttnn.div(ttnn.add(col, 0.5), float(w))
+                y_norm = ttnn.div(ttnn.add(row, 0.5), float(h))
+                wh_norm = ttnn.add(zero, float(grid_size * (2.0 ** lvl)))
+                x_acc = ttnn.where(in_level, x_norm, x_acc)
+                y_acc = ttnn.where(in_level, y_norm, y_acc)
+                w_acc = ttnn.where(in_level, wh_norm, w_acc)
+                h_acc = ttnn.where(in_level, wh_norm, h_acc)
+                start = end
+
+        anchors = ttnn.concat(
+            [
+                ttnn.reshape(x_acc, (batch, k, 1)),
+                ttnn.reshape(y_acc, (batch, k, 1)),
+                ttnn.reshape(w_acc, (batch, k, 1)),
+                ttnn.reshape(h_acc, (batch, k, 1)),
+            ],
+            dim=2,
+        )
+        one = ttnn.full_like(anchors, 1.0)
+        denom = ttnn.subtract(one, anchors)
+        ratio = ttnn.div(anchors, denom)
+        return ttnn.log(ratio)
+
+    def _anchors_from_level_indices_ttnn(
+        self,
+        idx_tt,
+        h: int,
+        w: int,
+        lvl: int,
+        batch: int,
+        k: int,
+    ) -> "ttnn.Tensor":
+        """Recreate one feature level's anchors from local top-k indices."""
+        ttnn = self.ttnn
+        if idx_tt.get_layout() != ttnn.TILE_LAYOUT:
+            idx_tt = ttnn.to_layout(idx_tt, ttnn.TILE_LAYOUT)
+        idx_f = idx_tt if idx_tt.dtype == ttnn.float32 else ttnn.typecast(idx_tt, ttnn.float32)
+        zero = ttnn.multiply(idx_f, 0.0)
+        row = ttnn.floor(ttnn.div(idx_f, float(w)))
+        col = ttnn.subtract(idx_f, ttnn.multiply(row, float(w)))
+        x_acc = ttnn.div(ttnn.add(col, 0.5), float(w))
+        y_acc = ttnn.div(ttnn.add(row, 0.5), float(h))
+        wh_acc = ttnn.add(zero, float(0.05 * (2.0 ** lvl)))
+        anchors = ttnn.concat(
+            [
+                ttnn.reshape(x_acc, (batch, k, 1)),
+                ttnn.reshape(y_acc, (batch, k, 1)),
+                ttnn.reshape(wh_acc, (batch, k, 1)),
+                ttnn.reshape(wh_acc, (batch, k, 1)),
+            ],
+            dim=2,
+        )
+        one = ttnn.full_like(anchors, 1.0)
+        denom = ttnn.subtract(one, anchors)
+        ratio = ttnn.div(anchors, denom)
+        return ttnn.log(ratio)
+
     def _topk_gather_ttnn(
         self,
         enc_logits: "ttnn.Tensor",  # [B, L, C] or [B, L, 1]
         anchors: "ttnn.Tensor",     # [B, L, 4]
         memory: "ttnn.Tensor",      # [B, L, C_hidden]
         k: int,
+        spatial_shapes: Optional[List[List[int]]] = None,
         return_ttnn: bool = False,
     ) -> Tuple["ttnn.Tensor", "ttnn.Tensor", "ttnn.Tensor", "ttnn.Tensor"]:
         """Perform on-device top-k over sequence dim and gather anchors/memory accordingly.
@@ -766,6 +948,17 @@ class DFINETransformerTTNN(nn.Module):
         ttnn = self.ttnn
         def _ensure_layout(tensor, layout):
             return tensor if tensor.get_layout() == layout else ttnn.to_layout(tensor, layout)
+        def _time_topk(name, fn):
+            timing_entries = self._topk_timing_entries
+            if timing_entries is None or os.environ.get("TTNN_TOPK_TIMING", "0") != "1":
+                return fn()
+            ttnn.synchronize_device(self.device)
+            t0 = time.perf_counter()
+            out = fn()
+            ttnn.synchronize_device(self.device)
+            t1 = time.perf_counter()
+            timing_entries.append((name, (t1 - t0) * 1000.0))
+            return out
 
         if not (_is_ttnn_tensor(enc_logits) and _is_ttnn_tensor(anchors) and _is_ttnn_tensor(memory)):
             raise TypeError("TTNN topk expects TTNN logits/anchors/memory tensors")
@@ -787,42 +980,391 @@ class DFINETransformerTTNN(nn.Module):
         if enc_logits.shape[-1] == 1:
             scores_tt = ttnn.squeeze(enc_logits_tt, dim=-1)
         else:
-            idx_tt = ttnn.argmax(enc_logits_tt, dim=-1)
-            if list(idx_tt.shape) != [B, L]:
-                idx_tt = ttnn.reshape(idx_tt, (B, L))
-            idx_tt = _ensure_layout(idx_tt, ttnn.TILE_LAYOUT)
-            if idx_tt.dtype != ttnn.uint32:
-                idx_tt = ttnn.typecast(idx_tt, ttnn.uint32)
-            idx_tt = ttnn.reshape(idx_tt, (B, L, 1))
-            scores_3d = ttnn.gather(enc_logits_tt, dim=-1, index=idx_tt)
-            scores_tt = ttnn.reshape(scores_3d, (B, L))
+            scores_tt = _time_topk("topk.score_max", lambda: ttnn.max(enc_logits_tt, dim=-1))
+            if list(scores_tt.shape) != [B, L]:
+                scores_tt = ttnn.reshape(scores_tt, (B, L))
         if self.trace_mode:
             if scores_tt.get_layout() != ttnn.TILE_LAYOUT:
                 raise RuntimeError("Decoder trace_mode expects scores in TILE layout.")
         else:
             scores_tt = ttnn.to_layout(scores_tt, ttnn.TILE_LAYOUT)
         scores_tt = ttnn.fill_implicit_tile_padding(scores_tt, -1.0e9)
-        scores_for_topk = scores_tt if scores_tt.dtype == self.dtype else ttnn.typecast(scores_tt, self.dtype)
-        topk_vals_tt, topk_idx_tt = ttnn.topk(scores_for_topk, k=k, dim=1, largest=True, sorted=True)
+        topk_score_dtype_env = os.environ.get("TTNN_TOPK_SCORE_DTYPE", "").lower()
+        if topk_score_dtype_env in ("bfloat8_b", "bf8", "bfp8", "bfp8_b"):
+            topk_score_dtype = ttnn.bfloat8_b
+        else:
+            topk_score_dtype = self.dtype
+        scores_for_topk = (
+            scores_tt if scores_tt.dtype == topk_score_dtype else ttnn.typecast(scores_tt, topk_score_dtype)
+        )
+        use_multipass_topk = os.environ.get("TTNN_TOPK_MULTIPASS64", "0") != "0" and k > 64
+        if os.environ.get("TTNN_TOPK_PAD_POWER2", "0") != "0" or use_multipass_topk:
+            padded_l = 1 << (int(L) - 1).bit_length()
+            if padded_l != int(L):
+                pad_width = padded_l - int(L)
+                pad_tt = self.trace_ctx.topk_score_pad if self.trace_ctx is not None else None
+                if pad_tt is None:
+                    pad_tt = ttnn.full(
+                        (B, pad_width),
+                        -1.0e9,
+                        device=self.device,
+                        dtype=scores_for_topk.dtype,
+                        layout=ttnn.TILE_LAYOUT,
+                    )
+                scores_for_topk = ttnn.concat([scores_for_topk, pad_tt], dim=1)
+        tie_break_eps = float(os.environ.get("TTNN_TOPK_TIE_BREAK_EPS", "0") or "0")
+        if tie_break_eps != 0.0:
+            topk_len_for_tie = int(scores_for_topk.shape[1])
+            tie_break = self.trace_ctx.topk_tie_break if self.trace_ctx is not None else None
+            if tie_break is None:
+                tie_break = ttnn.arange(0, topk_len_for_tie, 1, device=self.device, dtype=ttnn.float32)
+                tie_break = ttnn.reshape(tie_break, (1, topk_len_for_tie))
+                if int(B) != 1:
+                    tie_break = ttnn.repeat(tie_break, (int(B), 1))
+                tie_break = ttnn.multiply(tie_break, tie_break_eps / max(1, topk_len_for_tie - 1))
+            if list(tie_break.shape) != [B, topk_len_for_tie]:
+                tie_break = ttnn.reshape(tie_break, (B, topk_len_for_tie))
+            if tie_break.dtype != scores_for_topk.dtype:
+                tie_break = ttnn.typecast(tie_break, scores_for_topk.dtype)
+            if tie_break.get_layout() != scores_for_topk.get_layout():
+                tie_break = ttnn.to_layout(tie_break, scores_for_topk.get_layout())
+            scores_for_topk = _time_topk(
+                "topk.tie_break_add",
+                lambda scores_for_topk=scores_for_topk, tie_break=tie_break: ttnn.add(scores_for_topk, tie_break),
+            )
+        topk_sorted = os.environ.get("TTNN_TOPK_SORTED", "1") != "0"
+        level_quotas_env = os.environ.get("TTNN_TOPK_LEVEL_QUOTAS")
+        if level_quotas_env:
+            if spatial_shapes is None:
+                raise RuntimeError("TTNN_TOPK_LEVEL_QUOTAS requires spatial_shapes.")
+            level_quotas = [max(0, int(part.strip())) for part in level_quotas_env.split(",") if part.strip()]
+            if len(level_quotas) != len(spatial_shapes):
+                raise ValueError(
+                    f"TTNN_TOPK_LEVEL_QUOTAS expected {len(spatial_shapes)} entries, got {len(level_quotas)}"
+                )
+            vals_parts = []
+            idx_parts = []
+            anchor_parts = []
+            memory_parts = []
+            start = 0
+            for lvl, ((h, w), quota) in enumerate(zip(spatial_shapes, level_quotas)):
+                h = int(h)
+                w = int(w)
+                level_len = h * w
+                quota = min(int(quota), level_len)
+                if quota <= 0:
+                    start += level_len
+                    continue
+                scores_lvl = _time_topk(
+                    f"topk.level{lvl}.scores_slice",
+                    lambda start=start, level_len=level_len: ttnn.slice(
+                        scores_for_topk,
+                        [0, start],
+                        [B, start + level_len],
+                    ),
+                )
+                vals_part, idx_local = _time_topk(
+                    f"topk.level{lvl}.score_topk",
+                    lambda scores_lvl=scores_lvl, quota=quota: ttnn.topk(
+                        scores_lvl,
+                        k=quota,
+                        dim=1,
+                        largest=True,
+                        sorted=topk_sorted,
+                    ),
+                )
+                idx_local = ttnn.typecast(idx_local, ttnn.uint32)
+                if list(idx_local.shape) != [B, quota]:
+                    idx_local = ttnn.reshape(idx_local, (B, quota))
+                idx_local = _ensure_layout(idx_local, ttnn.TILE_LAYOUT)
+                vals_parts.append(vals_part)
+                idx_parts.append(
+                    _time_topk(
+                        f"topk.level{lvl}.global_idx",
+                        lambda idx_local=idx_local, start=start: ttnn.typecast(
+                            ttnn.add(ttnn.typecast(idx_local, ttnn.float32), float(start)),
+                            ttnn.uint32,
+                        ),
+                    )
+                )
+                anchor_parts.append(
+                    _time_topk(
+                        f"topk.level{lvl}.anchor_analytic",
+                        lambda idx_local=idx_local, h=h, w=w, lvl=lvl, quota=quota: self._anchors_from_level_indices_ttnn(
+                            idx_local,
+                            h,
+                            w,
+                            lvl,
+                            int(B),
+                            quota,
+                        ),
+                    )
+                )
+                memory_weight_tt, embedding_idx_tt = _time_topk(
+                    f"topk.level{lvl}.memory_embedding_prepare",
+                    lambda start=start, level_len=level_len, idx_local=idx_local: (
+                        ttnn.to_layout(
+                            ttnn.reshape(
+                                (
+                                    ttnn.slice(memory, [0, start, 0], [B, start + level_len, int(memory.shape[-1])])
+                                    if memory.dtype == self.dtype
+                                    else ttnn.typecast(
+                                        ttnn.slice(
+                                            memory,
+                                            [0, start, 0],
+                                            [B, start + level_len, int(memory.shape[-1])],
+                                        ),
+                                        self.dtype,
+                                    )
+                                ),
+                                (level_len, int(memory.shape[-1])),
+                            ),
+                            ttnn.ROW_MAJOR_LAYOUT,
+                        ),
+                        ttnn.to_layout(idx_local, ttnn.ROW_MAJOR_LAYOUT),
+                    ),
+                )
+                memory_parts.append(
+                    _time_topk(
+                        f"topk.level{lvl}.memory_embedding",
+                        lambda embedding_idx_tt=embedding_idx_tt, memory_weight_tt=memory_weight_tt: ttnn.embedding(
+                            embedding_idx_tt,
+                            memory_weight_tt,
+                            layout=ttnn.TILE_LAYOUT,
+                            dtype=self.dtype,
+                        ),
+                    )
+                )
+                start += level_len
+            if not vals_parts:
+                raise ValueError(f"TTNN_TOPK_LEVEL_QUOTAS selects no queries: {level_quotas_env!r}")
+            topk_vals_tt = ttnn.concat(vals_parts, dim=1)
+            topk_idx_tt = ttnn.concat(idx_parts, dim=1)
+            topk_anchors_tt = ttnn.concat(anchor_parts, dim=1)
+            topk_memory_tt = ttnn.concat(memory_parts, dim=1)
+            return topk_vals_tt, topk_idx_tt, topk_anchors_tt, topk_memory_tt
+        use_sort_topk = os.environ.get("TTNN_TOPK_USE_SORT", "0") != "0"
+        if use_sort_topk:
+            sort_dtype_env = os.environ.get("TTNN_TOPK_SORT_DTYPE", "").lower()
+            if sort_dtype_env in ("float32", "fp32", "f32"):
+                scores_for_sort = scores_tt if scores_tt.dtype == ttnn.float32 else ttnn.typecast(scores_tt, ttnn.float32)
+            else:
+                scores_for_sort = scores_for_topk
+            sorted_vals_tt, sorted_idx_tt = _time_topk(
+                "topk.score_sort",
+                lambda scores_for_sort=scores_for_sort: ttnn.sort(
+                    scores_for_sort,
+                    dim=1,
+                    descending=True,
+                ),
+            )
+            topk_vals_tt = _time_topk(
+                "topk.sort_vals_slice",
+                lambda sorted_vals_tt=sorted_vals_tt: ttnn.slice(sorted_vals_tt, [0, 0], [B, k]),
+            )
+            topk_idx_tt = _time_topk(
+                "topk.sort_idx_slice",
+                lambda sorted_idx_tt=sorted_idx_tt: ttnn.slice(sorted_idx_tt, [0, 0], [B, k]),
+            )
+        elif use_multipass_topk:
+            pass_k = min(64, k)
+            num_passes = (k + pass_k - 1) // pass_k
+            topk_len = int(scores_for_topk.shape[1])
+            scores_current = scores_for_topk
+            vals_parts = []
+            idx_parts = []
+            rng_tt = self.trace_ctx.topk_mask_rng if self.trace_ctx is not None else None
+            use_threshold_mask = os.environ.get("TTNN_TOPK_MULTIPASS64_THRESHOLD", "0") != "0"
+            threshold_strict_gt = os.environ.get("TTNN_TOPK_MULTIPASS64_THRESHOLD_GT", "0") != "0"
+            for pass_idx in range(num_passes):
+                vals_part, idx_part = _time_topk(
+                    f"topk.score_topk_pass{pass_idx}",
+                    lambda scores_current=scores_current: ttnn.topk(
+                        scores_current,
+                        k=pass_k,
+                        dim=1,
+                        largest=True,
+                        sorted=True,
+                    ),
+                )
+                idx_part = ttnn.typecast(idx_part, ttnn.uint32)
+                if list(idx_part.shape) != [B, pass_k]:
+                    idx_part = ttnn.reshape(idx_part, (B, pass_k))
+                vals_parts.append(vals_part)
+                idx_parts.append(idx_part)
+                if pass_idx + 1 < num_passes:
+                    if use_threshold_mask:
+                        kth_value = _time_topk(
+                            f"topk.mask_threshold_pass{pass_idx}",
+                            lambda vals_part=vals_part: ttnn.slice(vals_part, [0, pass_k - 1], [B, pass_k]),
+                        )
+                        if list(kth_value.shape) != [B, 1]:
+                            kth_value = ttnn.reshape(kth_value, (B, 1))
+                        kth_value = _time_topk(
+                            f"topk.mask_threshold_repeat_pass{pass_idx}",
+                            lambda kth_value=kth_value: ttnn.repeat(kth_value, (1, topk_len)),
+                        )
+                        mask_tt = _time_topk(
+                            f"topk.mask_threshold_cmp_pass{pass_idx}",
+                            lambda scores_current=scores_current, kth_value=kth_value: (
+                                ttnn.gt(scores_current, kth_value)
+                                if threshold_strict_gt
+                                else ttnn.ge(scores_current, kth_value)
+                            ),
+                        )
+                        scores_current = _time_topk(
+                            f"topk.mask_threshold_apply_pass{pass_idx}",
+                            lambda scores_current=scores_current, mask_tt=mask_tt: ttnn.where(
+                                mask_tt,
+                                ttnn.add(ttnn.multiply(scores_current, 0.0), -1.0e9),
+                                scores_current,
+                            ),
+                        )
+                    else:
+                        one_hot = _time_topk(
+                            f"topk.mask_one_hot_pass{pass_idx}",
+                            lambda idx_part=idx_part: self._one_hot_from_indices_ttnn(
+                                idx_part,
+                                topk_len,
+                                int(B),
+                                pass_k,
+                                rng_tt=rng_tt,
+                                dtype=scores_current.dtype,
+                                trace_mode=self.trace_mode,
+                            ),
+                        )
+                        mask_tt = _time_topk(
+                            f"topk.mask_reduce_pass{pass_idx}",
+                            lambda one_hot=one_hot: ttnn.max(one_hot, dim=1),
+                        )
+                        if list(mask_tt.shape) != [B, topk_len]:
+                            mask_tt = ttnn.reshape(mask_tt, (B, topk_len))
+                        scores_current = _time_topk(
+                            f"topk.mask_apply_pass{pass_idx}",
+                            lambda scores_current=scores_current, mask_tt=mask_tt: ttnn.add(
+                                scores_current,
+                                ttnn.multiply(mask_tt, -1.0e9),
+                            ),
+                        )
+            topk_vals_tt = ttnn.concat(vals_parts, dim=1)
+            topk_idx_tt = ttnn.concat(idx_parts, dim=1)
+            if int(topk_idx_tt.shape[1]) != k:
+                topk_vals_tt = ttnn.slice(topk_vals_tt, [0, 0], [B, k])
+                topk_idx_tt = ttnn.slice(topk_idx_tt, [0, 0], [B, k])
+        else:
+            topk_vals_tt, topk_idx_tt = _time_topk(
+                "topk.score_topk",
+                lambda: ttnn.topk(scores_for_topk, k=k, dim=1, largest=True, sorted=topk_sorted),
+            )
         topk_idx_tt = ttnn.typecast(topk_idx_tt, ttnn.uint32)
         if list(topk_idx_tt.shape) != [B, k]:
             topk_idx_tt = ttnn.reshape(topk_idx_tt, (B, k))
         topk_idx_tt = _ensure_layout(topk_idx_tt, ttnn.TILE_LAYOUT)
 
-        idx_anchor = ttnn.reshape(topk_idx_tt, (B, k, 1))
-        idx_anchor = ttnn.repeat(idx_anchor, (1, 1, anchors.shape[-1]))
-        topk_anchors_tt = ttnn.gather(anchors, dim=1, index=idx_anchor)
+        use_analytic_anchor = (
+            os.environ.get("TTNN_TOPK_ANCHOR_ANALYTIC", "1") != "0"
+            and int(B) == 1
+            and spatial_shapes is not None
+        )
+        use_embedding_anchor = os.environ.get("TTNN_TOPK_ANCHOR_EMBEDDING", "0") != "0" and int(B) == 1
+        if use_analytic_anchor:
+            topk_anchors_tt = _time_topk(
+                "topk.anchor_analytic",
+                lambda: self._anchors_from_indices_ttnn(topk_idx_tt, spatial_shapes, int(B), int(k)),
+            )
+        elif use_embedding_anchor:
+            anchor_embedding_dtype = self.dtype
+            anchor_weight_tt, anchor_idx_tt = _time_topk(
+                "topk.anchor_embedding_prepare",
+                lambda: (
+                    ttnn.to_layout(
+                        ttnn.reshape(
+                            anchors if anchors.dtype == anchor_embedding_dtype else ttnn.typecast(anchors, anchor_embedding_dtype),
+                            (int(L), int(anchors.shape[-1])),
+                        ),
+                        ttnn.ROW_MAJOR_LAYOUT,
+                    ),
+                    ttnn.to_layout(topk_idx_tt, ttnn.ROW_MAJOR_LAYOUT),
+                ),
+            )
+            topk_anchors_tt = _time_topk(
+                "topk.anchor_embedding",
+                lambda: ttnn.embedding(
+                    anchor_idx_tt,
+                    anchor_weight_tt,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=anchor_embedding_dtype,
+                ),
+            )
+        elif os.environ.get("TTNN_TOPK_ANCHOR_TOSA_GATHER", "1") != "0":
+            topk_anchors_tt = _time_topk(
+                "topk.anchor_tosa_gather",
+                lambda: ttnn.tosa_gather(anchors, topk_idx_tt),
+            )
+        else:
+            idx_anchor = ttnn.reshape(topk_idx_tt, (B, k, 1))
+            idx_anchor = ttnn.repeat(idx_anchor, (1, 1, anchors.shape[-1]))
+            topk_anchors_tt = _time_topk("topk.anchor_gather", lambda: ttnn.gather(anchors, dim=1, index=idx_anchor))
 
-        idx_mem = ttnn.reshape(topk_idx_tt, (B, k, 1))
-        idx_mem = ttnn.repeat(idx_mem, (1, 1, memory.shape[-1]))
-        topk_memory_tt = ttnn.gather(memory, dim=1, index=idx_mem)
+        use_embedding_memory = os.environ.get("TTNN_TOPK_MEMORY_EMBEDDING", "1") != "0" and int(B) == 1
+        if use_embedding_memory:
+            memory_weight_tt, embedding_idx_tt = _time_topk(
+                "topk.memory_embedding_prepare",
+                lambda: (
+                    ttnn.to_layout(
+                        ttnn.reshape(
+                            memory if memory.dtype == self.dtype else ttnn.typecast(memory, self.dtype),
+                            (int(L), int(memory.shape[-1])),
+                        ),
+                        ttnn.ROW_MAJOR_LAYOUT,
+                    ),
+                    ttnn.to_layout(topk_idx_tt, ttnn.ROW_MAJOR_LAYOUT),
+                ),
+            )
+            topk_memory_tt = _time_topk(
+                "topk.memory_embedding",
+                lambda: ttnn.embedding(
+                    embedding_idx_tt,
+                    memory_weight_tt,
+                    layout=ttnn.TILE_LAYOUT,
+                    dtype=self.dtype,
+                ),
+            )
+        else:
+            idx_mem = ttnn.reshape(topk_idx_tt, (B, k, 1))
+            idx_mem = ttnn.repeat(idx_mem, (1, 1, memory.shape[-1]))
+            topk_memory_tt = _time_topk("topk.memory_gather", lambda: ttnn.gather(memory, dim=1, index=idx_mem))
 
         return topk_vals_tt, topk_idx_tt, topk_anchors_tt, topk_memory_tt
+
+    def _prepare_msda_value_list_ttnn(
+        self,
+        value_list: Sequence["ttnn.Tensor"],
+        spatial_shapes: Sequence[Sequence[int]],
+        batch_size: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> List["ttnn.Tensor"]:
+        """Prepare static MSDA value tensors once instead of once per decoder layer."""
+        ttnn = self.ttnn
+        prepared = []
+        bh = int(batch_size) * int(num_heads)
+        c_pad = (32 - (int(head_dim) % 32)) % 32
+        for v, (h, w) in zip(value_list, spatial_shapes):
+            v_tt = ttnn.reshape(v, (batch_size, num_heads, head_dim, int(h), int(w)))
+            v_tt = ttnn.permute(v_tt, (0, 1, 3, 4, 2))
+            v_tt = ttnn.reshape(v_tt, (bh, int(h), int(w), head_dim))
+            if c_pad != 0:
+                v_tt = ttnn.pad(v_tt, padding=[(0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
+            if v_tt.get_layout() != ttnn.ROW_MAJOR_LAYOUT:
+                v_tt = ttnn.to_layout(v_tt, ttnn.ROW_MAJOR_LAYOUT)
+            prepared.append(v_tt)
+        return prepared
 
     #Full forward
     def forward(self, feats: Sequence[TTActivation]) -> Dict[str, "ttnn.Tensor"]:
         ttnn = self.ttnn
-        timing_entries = None
+        timing_entries = [] if os.environ.get("TTNN_DECODER_TIMING", "0") == "1" else None
         def _time_block(name, fn):
             if timing_entries is None:
                 return fn()
@@ -868,18 +1410,24 @@ class DFINETransformerTTNN(nn.Module):
         enc_out_tt = _time_block("enc_output", lambda: self._enc_output_ttnn(memory_masked, return_ttnn=True))
         enc_logits_tt = _time_block("enc_score_head", lambda: self.enc_score_head_tt(enc_out_tt, return_ttnn=True))
 
-        _, _, topk_anchors_tt, topk_memory_tt = _time_block(
-            "topk_gather",
-            lambda: self._topk_gather_ttnn(
-                enc_logits_tt,
-                anchors_tt,
-                enc_out_tt,
-                self.decoder_pt.num_queries,
-                return_ttnn=True,
-            ),
-        )
-        topk_memory_tt = ttnn.typecast(topk_memory_tt, ttnn.float32)
-        topk_anchors_tt = ttnn.typecast(topk_anchors_tt, ttnn.float32)
+        self._topk_timing_entries = timing_entries
+        try:
+            _, _, topk_anchors_tt, topk_memory_tt = _time_block(
+                "topk_gather",
+                lambda: self._topk_gather_ttnn(
+                    enc_logits_tt,
+                    anchors_tt,
+                    enc_out_tt,
+                    self._num_queries(),
+                    spatial_shapes=spatial_shapes,
+                    return_ttnn=True,
+                ),
+            )
+        finally:
+            self._topk_timing_entries = None
+        if os.environ.get("TTNN_DECODER_TOPK_FP32", "1") != "0":
+            topk_memory_tt = ttnn.typecast(topk_memory_tt, ttnn.float32)
+            topk_anchors_tt = ttnn.typecast(topk_anchors_tt, ttnn.float32)
 
         enc_topk_bbox_unact = _time_block(
             "enc_bbox_head",
@@ -899,10 +1447,17 @@ class DFINETransformerTTNN(nn.Module):
         value_tt = ttnn.reshape(memory_blc_tt, (B, L, num_head, head_dim))
         value_tt = ttnn.permute(value_tt, (0, 2, 3, 1))
         value_list = ttnn.split(value_tt, split_shape, dim=3)
+        value_grid_list = _time_block(
+            "value_grid_prepare",
+            lambda: self._prepare_msda_value_list_ttnn(value_list, spatial_shapes, int(B), num_head, head_dim),
+        )
 
         eval_idx = int(
             self.decoder_pt.decoder.eval_idx if hasattr(self.decoder_pt.decoder, "eval_idx") else len(self.layers) - 1
         )
+        eval_idx_env = os.environ.get("TTNN_DECODER_EVAL_IDX")
+        if eval_idx_env is not None:
+            eval_idx = max(0, min(int(eval_idx_env), len(self.layers) - 1))
 
         dec_out_bboxes_tt = None
         dec_out_logits_tt = None
@@ -929,7 +1484,7 @@ class DFINETransformerTTNN(nn.Module):
                 lambda: layer(
                     output_tt,
                     ref_points_input,
-                    value_list,
+                    value_grid_list,
                     spatial_shapes,
                     attn_mask=None,
                     query_pos_embed=query_pos_embed,
@@ -962,12 +1517,16 @@ class DFINETransformerTTNN(nn.Module):
                 pred_corners_tt = ttnn.add(pred_corners_tt, prev_pred_corners)
             pred_corners_tt = ttnn.typecast(pred_corners_tt, ttnn.float32)
 
+            distance_tt = _time_block(
+                f"layer{i}.integral",
+                lambda: self.integral(pred_corners_tt, self.project_tt, return_ttnn=True),
+            )
             inter_ref_bbox = _time_block(
-                f"layer{i}.integral_distance2bbox",
+                f"layer{i}.distance2bbox",
                 lambda: _ttnn_distance2bbox(
                     ttnn,
                     ref_points_initial,
-                    self.integral(pred_corners_tt, self.project_tt, return_ttnn=True),
+                    distance_tt,
                     self.reg_scale,
                     trace_mode=self.trace_mode,
                 ),
@@ -1071,6 +1630,8 @@ class TTNNMSDeformableAttention(nn.Module):
         else:
             raise RuntimeError(f"Unsupported weight store mode: {weight_store.mode}")
         self._offset_norm_cache = {}
+        self._timing_entries = None
+        self._timing_prefix = None
 
     def _get_offset_norm_levels(self, value_spatial_shapes: List[List[int]]):
         key = tuple(tuple(int(x) for x in pair) for pair in value_spatial_shapes)
@@ -1094,14 +1655,28 @@ class TTNNMSDeformableAttention(nn.Module):
         return_ttnn: bool = False,
     ) -> "ttnn.Tensor":
         ttnn = self.ttnn
+        timing_entries = self._timing_entries
+        timing_prefix = self._timing_prefix
+
+        def _time_block(name, fn):
+            if timing_entries is None or timing_prefix is None:
+                return fn()
+            ttnn.synchronize_device(self.device)
+            t0 = time.perf_counter()
+            out = fn()
+            ttnn.synchronize_device(self.device)
+            t1 = time.perf_counter()
+            timing_entries.append((f"{timing_prefix}.{name}", (t1 - t0) * 1000.0))
+            return out
+
         if not _is_ttnn_tensor(query):
             raise TypeError("TTNN MSDA expects TTNN query tensor")
         B, Lq, C = query.shape
 
         # Offsets and attention weights via TTNN linear
         q_tt = query
-        off = ttnn.linear(q_tt, self.W_off, bias=self.b_off)  # [B,Lq,total_points*2] (padded)
-        attn = ttnn.linear(q_tt, self.W_attn, bias=self.b_attn)  # [B,Lq,total_points] (padded)
+        off = _time_block("offset_linear", lambda: ttnn.linear(q_tt, self.W_off, bias=self.b_off))
+        attn = _time_block("attn_linear", lambda: ttnn.linear(q_tt, self.W_attn, bias=self.b_attn))
         if off.get_layout() != ttnn.TILE_LAYOUT:
             if self.trace_mode:
                 raise RuntimeError("trace_mode expects TILE layout for MSDA offsets")
@@ -1115,7 +1690,10 @@ class TTNNMSDeformableAttention(nn.Module):
         off = ttnn.reshape(off, (B, Lq, self.num_heads, self.points_per_head, 2))
         # Softmax must be per-head, matching Torch (B, Lq, num_heads, num_points)
         attn = ttnn.reshape(attn, (B, Lq, self.num_heads, self.points_per_head))
-        attn = _softmax_lastdim_ttnn(ttnn, attn, dim=-1, trace_mode=self.trace_mode)
+        attn = _time_block(
+            "attn_softmax",
+            lambda: _softmax_lastdim_ttnn(ttnn, attn, dim=-1, trace_mode=self.trace_mode),
+        )
 
         # Compute sampling locations in [0,1] per level
         if not _is_ttnn_tensor(reference_points):
@@ -1128,6 +1706,7 @@ class TTNNMSDeformableAttention(nn.Module):
             ref_tt = reference_points
         if ref_tt.dtype != ttnn.float32:
             ref_tt = ttnn.typecast(ref_tt, ttnn.float32)
+        direct_grid = False
         if reference_points.shape[-1] == 2:
             sampling_locations_per_level = []
             off_splits = ttnn.split(off, self.num_points_list, dim=3)
@@ -1140,9 +1719,21 @@ class TTNNMSDeformableAttention(nn.Module):
                 norm_lvl = norm_levels[lvl]
                 norm_lvl = ttnn.repeat(norm_lvl, (B, Lq, self.num_heads, self.num_points_list[lvl], 1))
 
-                loc = ttnn.add(ref_lvl, ttnn.div(off_splits[lvl], norm_lvl))
+                loc = _time_block(
+                    f"level{lvl}.sampling_locations",
+                    lambda ref_lvl=ref_lvl, off_lvl=off_splits[lvl], norm_lvl=norm_lvl: ttnn.add(
+                        ref_lvl,
+                        ttnn.div(off_lvl, norm_lvl),
+                    ),
+                )
                 sampling_locations_per_level.append(loc)
         elif reference_points.shape[-1] == 4:
+            direct_grid_env = os.environ.get("TTNN_MSDA_DIRECT_GRID")
+            if direct_grid_env is None:
+                auto_max_queries = int(os.environ.get("TTNN_MSDA_DIRECT_GRID_AUTO_MAX_QUERIES", "96"))
+                direct_grid = int(Lq) <= auto_max_queries
+            else:
+                direct_grid = direct_grid_env != "0"
             if reference_points.shape[2] == 1 and self.num_levels > 1:
                 ref_tt = ttnn.repeat(ref_tt, (1, 1, self.num_levels, 1))
             off_splits = ttnn.split(off, self.num_points_list, dim=3)
@@ -1153,17 +1744,30 @@ class TTNNMSDeformableAttention(nn.Module):
                 ref_xy = ttnn.slice(ref_lvl, [0, 0, 0, 0, 0], [B, Lq, 1, 1, 2])
                 ref_wh = ttnn.slice(ref_lvl, [0, 0, 0, 0, 2], [B, Lq, 1, 1, 4])
 
+                scale = float(self.offset_scale) / float(self.num_points_list[lvl])
+                if direct_grid:
+                    ref_xy = _time_block(f"level{lvl}.ref_xy_grid_scale", lambda ref_xy=ref_xy: ttnn.multiply(ref_xy, 2.0))
+                    ref_xy = _time_block(f"level{lvl}.ref_xy_grid_shift", lambda ref_xy=ref_xy: ttnn.subtract(ref_xy, 1.0))
+                    scale *= 2.0
+                    if scale != 1.0:
+                        ref_wh = _time_block(
+                            f"level{lvl}.ref_wh_scale",
+                            lambda ref_wh=ref_wh, scale=scale: ttnn.multiply(ref_wh, scale),
+                        )
                 ref_xy = ttnn.repeat(ref_xy, (1, 1, self.num_heads, self.num_points_list[lvl], 1))
                 ref_wh = ttnn.repeat(ref_wh, (1, 1, self.num_heads, self.num_points_list[lvl], 1))
 
-                scale = float(self.offset_scale) / float(self.num_points_list[lvl])
                 off_lvl = ttnn.multiply(off_splits[lvl], ref_wh)
-                if scale != 1.0:
+                if (not direct_grid) and scale != 1.0:
                     off_lvl = ttnn.multiply(off_lvl, scale)
-                loc = ttnn.add(ref_xy, off_lvl)
+                loc = _time_block(
+                    f"level{lvl}.sampling_locations",
+                    lambda ref_xy=ref_xy, off_lvl=off_lvl: ttnn.add(ref_xy, off_lvl),
+                )
                 sampling_locations_per_level.append(loc)
         else:
             raise ValueError("reference_points last dim must be 2 or 4")
+        grid_already_normalized = direct_grid and reference_points.shape[-1] == 4
 
         # Prepare attention_weights per level
         attn_splits = ttnn.split(attn, self.num_points_list, dim=3)
@@ -1176,49 +1780,136 @@ class TTNNMSDeformableAttention(nn.Module):
             if not _is_ttnn_tensor(v):
                 raise TypeError("TTNN MSDA expects TTNN value tensors")
             v_shape = list(v.shape)
-            if len(v_shape) == 4:
+            Bh = B * self.num_heads
+            prepared_nhwc = (
+                len(v_shape) == 4
+                and int(v_shape[0]) == int(Bh)
+                and int(v_shape[1]) == int(h)
+                and int(v_shape[2]) == int(w)
+                and int(v_shape[3]) >= int(self.head_dim)
+            )
+            if prepared_nhwc:
+                v_tt = v
+            elif len(v_shape) == 4:
                 v_tt = ttnn.reshape(v, (B, self.num_heads, self.head_dim, h, w))
             else:
                 v_tt = v
-            Bh = B * self.num_heads
             # NHWC input for TTNN grid_sample
-            v_tt = ttnn.permute(v_tt, (0, 1, 3, 4, 2))
-            v_tt = ttnn.reshape(v_tt, (Bh, h, w, self.head_dim))
             c_pad = (32 - (self.head_dim % 32)) % 32
-            if c_pad != 0:
-                v_tt = ttnn.pad(v_tt, padding=[(0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
+            if not prepared_nhwc:
+                v_tt = ttnn.permute(v_tt, (0, 1, 3, 4, 2))
+                v_tt = ttnn.reshape(v_tt, (Bh, h, w, self.head_dim))
+                if c_pad != 0:
+                    v_tt = ttnn.pad(v_tt, padding=[(0, 0), (0, 0), (0, 0), (0, c_pad)], value=0.0)
             if v_tt.get_layout() != ttnn.ROW_MAJOR_LAYOUT:
                 v_tt = ttnn.to_layout(v_tt, ttnn.ROW_MAJOR_LAYOUT)
 
             # Grid for this level: [B, Lq, H, num_points_lvl, 2] -> reshape to [Bh, Lq, num_points_lvl, 2]
             loc = sampling_locations_per_level[lvl]  # [B,Lq,H,num_pts,2]
-            grid_tt = ttnn.permute(loc, (0, 2, 1, 3, 4))
-            grid_tt = ttnn.reshape(grid_tt, (Bh, Lq, self.num_points_list[lvl], 2))
+            grid_tt = _time_block(f"level{lvl}.grid_permute", lambda loc=loc: ttnn.permute(loc, (0, 2, 1, 3, 4)))
+            num_points = self.num_points_list[lvl]
+            grid_tt = ttnn.reshape(grid_tt, (Bh, Lq, num_points, 2))
             # Normalize to [-1, 1] and cast to FP32
-            grid_tt = ttnn.multiply(grid_tt, 2.0)
-            grid_tt = ttnn.subtract(grid_tt, 1.0)
-            grid_tt = ttnn.typecast(grid_tt, ttnn.float32)
+            if not grid_already_normalized:
+                if os.environ.get("TTNN_MSDA_GRID_MAC", "1") != "0":
+                    grid_tt = _time_block(
+                        f"level{lvl}.grid_mac",
+                        lambda grid_tt=grid_tt: ttnn.mac(grid_tt, 2.0, -1.0),
+                    )
+                else:
+                    grid_tt = _time_block(f"level{lvl}.grid_scale", lambda grid_tt=grid_tt: ttnn.multiply(grid_tt, 2.0))
+                    grid_tt = _time_block(f"level{lvl}.grid_shift", lambda grid_tt=grid_tt: ttnn.subtract(grid_tt, 1.0))
+            if os.environ.get("TTNN_GRID_SAMPLE_GRID_FP32", "0") != "0":
+                grid_tt = _time_block(f"level{lvl}.grid_fp32", lambda grid_tt=grid_tt: ttnn.typecast(grid_tt, ttnn.float32))
             if grid_tt.get_layout() != ttnn.ROW_MAJOR_LAYOUT:
-                grid_tt = ttnn.to_layout(grid_tt, ttnn.ROW_MAJOR_LAYOUT)
+                grid_tt = _time_block(
+                    f"level{lvl}.grid_to_row_major",
+                    lambda grid_tt=grid_tt: ttnn.to_layout(grid_tt, ttnn.ROW_MAJOR_LAYOUT),
+                )
+            pack_points = os.environ.get("TTNN_GRID_SAMPLE_PACK_POINTS", "0") != "0" and num_points > 1
+            batch_output_channels = (
+                pack_points and os.environ.get("TTNN_GRID_SAMPLE_BATCH_OUTPUT_CHANNELS", "0") != "0"
+            )
+            if pack_points:
+                grid_tt = ttnn.reshape(grid_tt, (Bh, Lq, 1, 2 * num_points))
+            shard_grid = os.environ.get("TTNN_GRID_SAMPLE_SHARD_GRID", "0") != "0"
+            if shard_grid:
+                grid_size = self.device.compute_with_storage_grid_size()
+                grid_core_x = int(os.environ.get("TTNN_GRID_SAMPLE_SHARD_GRID_X", grid_size.x))
+                grid_core_y = int(os.environ.get("TTNN_GRID_SAMPLE_SHARD_GRID_Y", grid_size.y))
+                grid_core_x = max(1, min(grid_core_x, int(grid_size.x)))
+                grid_core_y = max(1, min(grid_core_y, int(grid_size.y)))
+                grid_mem_config = ttnn.create_sharded_memory_config_(
+                    grid_tt.shape,
+                    ttnn.CoreGrid(x=grid_core_x, y=grid_core_y),
+                    ttnn.ShardStrategy.HEIGHT,
+                    ttnn.ShardOrientation.ROW_MAJOR,
+                )
+                grid_tt = ttnn.to_memory_config(grid_tt, grid_mem_config)
 
-            out = ttnn.grid_sample(v_tt, grid_tt, mode="bilinear", padding_mode="zeros", use_precomputed_grid=False)
-            out_chw = ttnn.permute(out, (0, 3, 1, 2))
+            grid_sample_kwargs = {
+                "mode": "bilinear",
+                "padding_mode": "zeros",
+                "use_precomputed_grid": False,
+                "batch_output_channels": batch_output_channels,
+            }
+            if os.environ.get("TTNN_GRID_SAMPLE_OUTPUT_L1", "1") != "0":
+                grid_sample_kwargs["memory_config"] = ttnn.L1_MEMORY_CONFIG
+            out = _time_block(
+                f"level{lvl}.grid_sample",
+                lambda v_tt=v_tt, grid_tt=grid_tt, grid_sample_kwargs=grid_sample_kwargs: ttnn.grid_sample(
+                    v_tt,
+                    grid_tt,
+                    **grid_sample_kwargs,
+                ),
+            )
+            if shard_grid:
+                out = _time_block(
+                    f"level{lvl}.grid_sample_to_l1",
+                    lambda out=out: ttnn.to_memory_config(out, ttnn.L1_MEMORY_CONFIG),
+                )
+            if batch_output_channels:
+                out = ttnn.reshape(out, (Bh, Lq, num_points, int(v_tt.shape[-1])))
+                out_chw = _time_block(
+                    f"level{lvl}.out_permute",
+                    lambda out=out: ttnn.permute(out, (0, 3, 1, 2)),
+                )
+            else:
+                out_chw = _time_block(
+                    f"level{lvl}.out_permute",
+                    lambda out=out: ttnn.permute(out, (0, 3, 1, 2)),
+                )
             if c_pad != 0:
-                out_chw = ttnn.slice(out_chw, [0, 0, 0, 0], [Bh, self.head_dim, Lq, self.num_points_list[lvl]])
+                out_chw = _time_block(
+                    f"level{lvl}.out_unpad",
+                    lambda out_chw=out_chw: ttnn.slice(out_chw, [0, 0, 0, 0], [Bh, self.head_dim, Lq, num_points]),
+                )
             # Binary ops require TILE layout; make the boundary explicit.
             if out_chw.get_layout() != ttnn.TILE_LAYOUT:
-                out_chw = ttnn.to_layout(out_chw, ttnn.TILE_LAYOUT)
+                out_chw = _time_block(
+                    f"level{lvl}.out_to_tile",
+                    lambda out_chw=out_chw: ttnn.to_layout(out_chw, ttnn.TILE_LAYOUT),
+                )
             # Apply attention weights for this level: [B, Lq, H, P] -> [Bh, 1, Lq, P]
             aw = attn_splits[lvl]  # [B,Lq,H,P]
-            aw_bh = ttnn.permute(aw, (0, 2, 1, 3))
-            aw_bh = ttnn.reshape(aw_bh, (Bh, 1, Lq, self.num_points_list[lvl]))
+            aw_bh = _time_block(f"level{lvl}.attn_permute", lambda aw=aw: ttnn.permute(aw, (0, 2, 1, 3)))
+            aw_bh = ttnn.reshape(aw_bh, (Bh, 1, Lq, num_points))
             if aw_bh.get_layout() != ttnn.TILE_LAYOUT:
-                aw_bh = ttnn.to_layout(aw_bh, ttnn.TILE_LAYOUT)
-            weighted = ttnn.multiply(out_chw, aw_bh)
+                aw_bh = _time_block(
+                    f"level{lvl}.attn_to_tile",
+                    lambda aw_bh=aw_bh: ttnn.to_layout(aw_bh, ttnn.TILE_LAYOUT),
+                )
+            weighted = _time_block(
+                f"level{lvl}.weighted",
+                lambda out_chw=out_chw, aw_bh=aw_bh: ttnn.multiply(out_chw, aw_bh),
+            )
             # Sum over points
-            wsum = ttnn.sum(weighted, dim=3)  # (Bh, C, Lq)
+            wsum = _time_block(f"level{lvl}.sum_points", lambda weighted=weighted: ttnn.sum(weighted, dim=3))
 
-            sampled_sum = wsum if sampled_sum is None else ttnn.add(sampled_sum, wsum)
+            sampled_sum = wsum if sampled_sum is None else _time_block(
+                f"level{lvl}.accumulate",
+                lambda sampled_sum=sampled_sum, wsum=wsum: ttnn.add(sampled_sum, wsum),
+            )
 
         # Reshape back: (Bh, C, Lq) -> (B, H, C_head, Lq)
         out = ttnn.reshape(sampled_sum, (B, self.num_heads, self.head_dim, Lq))
@@ -1349,10 +2040,21 @@ class TTNNTransformerDecoderLayer(nn.Module):
             if query_pos_embed is not None
             else _ensure_tile(x_tt)
         )
-        ca_tt = _time_block(
-            "cross_attn",
-            lambda: self.cross_attn(qpos_tt, reference_points, value_list, spatial_shapes, return_ttnn=True),
-        )
+        msda_timing = os.environ.get("TTNN_MSDA_TIMING", "0") == "1"
+        if msda_timing and timing_entries is not None and timing_prefix is not None:
+            self.cross_attn._timing_entries = timing_entries
+            self.cross_attn._timing_prefix = f"{timing_prefix}.cross_attn"
+        else:
+            self.cross_attn._timing_entries = None
+            self.cross_attn._timing_prefix = None
+        try:
+            ca_tt = _time_block(
+                "cross_attn",
+                lambda: self.cross_attn(qpos_tt, reference_points, value_list, spatial_shapes, return_ttnn=True),
+            )
+        finally:
+            self.cross_attn._timing_entries = None
+            self.cross_attn._timing_prefix = None
         if ca_tt.dtype != x_tt.dtype:
             ca_tt = ttnn.typecast(ca_tt, x_tt.dtype)
 

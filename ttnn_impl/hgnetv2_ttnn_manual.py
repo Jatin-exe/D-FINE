@@ -11,6 +11,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import ttnn
 
@@ -39,6 +40,48 @@ def _env_optional_int(name: str, *, min_value: Optional[int] = None) -> Optional
     if min_value is not None and parsed < min_value:
         raise ValueError(f"Expected {name} >= {min_value}, got {parsed}")
     return parsed
+
+
+def _env_optional_bool(name: str) -> Optional[bool]:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on"):
+        return True
+    if normalized in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"Expected {name} to be a boolean, got {value!r}")
+
+
+def _env_optional_ttnn_dtype(name: str):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized in ("bf16", "bfloat16"):
+        return ttnn.bfloat16
+    if normalized in ("bf8", "bfloat8", "bfloat8_b"):
+        return ttnn.bfloat8_b
+    if normalized in ("fp32", "float32"):
+        return ttnn.float32
+    raise ValueError(f"Unsupported {name}={value!r}; expected bf16, bf8, or fp32")
+
+
+def _env_optional_shard_layout(name: str):
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    normalized = value.strip().lower().replace("-", "_")
+    if normalized in ("height", "height_sharded"):
+        return ttnn.TensorMemoryLayout.HEIGHT_SHARDED
+    if normalized in ("block", "block_sharded"):
+        return ttnn.TensorMemoryLayout.BLOCK_SHARDED
+    if normalized in ("width", "width_sharded"):
+        return ttnn.TensorMemoryLayout.WIDTH_SHARDED
+    if normalized in ("auto", "auto_shape", "shape"):
+        return "auto_shape"
+    raise ValueError(f"Unsupported {name}={value!r}; expected height, block, width, or auto")
 
 
 # Production defaults: fast runtime, model cache, and strict fallback handling.
@@ -125,15 +168,20 @@ def _is_ttnn_tensor(x) -> bool:
 def _concat_activations(acts: Sequence[TTActivation], trace_mode: bool = False) -> TTActivation:
     if not acts:
         raise ValueError("concat requires non-empty sequence")
+    trace_align = trace_mode and os.environ.get("TTNN_TRACE_CONCAT_ALIGN", "0") != "0"
     base = acts[0]
     base_dtype = base.tensor.dtype
     base_layout = base.tensor.get_layout()
-    base_mem_cfg = ttnn.get_memory_config(base.tensor) if trace_mode else ttnn.DRAM_MEMORY_CONFIG
+    preserve_memory = trace_mode or os.environ.get("TTNN_CONCAT_PRESERVE_MEMORY", "0") == "1"
+    base_mem_cfg = ttnn.get_memory_config(base.tensor) if preserve_memory else ttnn.DRAM_MEMORY_CONFIG
+    if preserve_memory and hasattr(base_mem_cfg, "is_sharded") and base_mem_cfg.is_sharded():
+        preserve_memory = False
+        base_mem_cfg = ttnn.DRAM_MEMORY_CONFIG
     nhwc_tensors = []
     for act in acts:
         nhwc = _activation_to_nhwc(act)
         if nhwc.dtype != base_dtype:
-            if trace_mode:
+            if trace_mode and not trace_align:
                 raise RuntimeError("trace_mode expects matching dtypes for concat")
             if nhwc.get_layout() != ttnn.TILE_LAYOUT:
                 nhwc = ttnn.to_layout(nhwc, ttnn.TILE_LAYOUT)
@@ -141,15 +189,18 @@ def _concat_activations(acts: Sequence[TTActivation], trace_mode: bool = False) 
             if base_layout != ttnn.TILE_LAYOUT:
                 nhwc = ttnn.to_layout(nhwc, base_layout)
         if nhwc.get_layout() != base_layout:
-            if trace_mode:
+            if trace_mode and not trace_align:
                 raise RuntimeError("trace_mode expects matching layouts for concat")
             nhwc = ttnn.to_layout(nhwc, base_layout)
         if ttnn.get_memory_config(nhwc) != base_mem_cfg:
-            if trace_mode:
+            if trace_mode and not trace_align:
                 raise RuntimeError("trace_mode expects matching memory configs for concat")
             nhwc = ttnn.to_memory_config(nhwc, base_mem_cfg)
         nhwc_tensors.append(nhwc)
-    concatenated_nhwc = ttnn.concat(nhwc_tensors, dim=-1)
+    if preserve_memory:
+        concatenated_nhwc = ttnn.concat(nhwc_tensors, dim=-1, memory_config=base_mem_cfg)
+    else:
+        concatenated_nhwc = ttnn.concat(nhwc_tensors, dim=-1)
     channels = sum(act.channels for act in acts)
     return _activation_from_nhwc(concatenated_nhwc, base.batch, base.height, base.width, channels)
 
@@ -283,6 +334,16 @@ class TTNNConv2d(nn.Module):
             raise ValueError(f"Unsupported weight_store mode: {weight_store.mode}")
         if weight is None:
             raise ValueError("TTNNConv2d requires weights; provide weight_store or torch weights")
+        if _is_ttnn_tensor(weight):
+            self.weight_torch = self.ttnn.to_torch(weight).detach().clone().to(torch.float32)
+        else:
+            self.weight_torch = weight.detach().clone().to(torch.float32)
+        if bias is None:
+            self.bias_torch = None
+        elif _is_ttnn_tensor(bias):
+            self.bias_torch = self.ttnn.to_torch(bias).detach().clone().reshape(-1).to(torch.float32)
+        else:
+            self.bias_torch = bias.detach().clone().reshape(-1).to(torch.float32)
         if not _is_ttnn_tensor(weight):
             weight = weight.detach().clone()
             bias = bias.detach().clone() if bias is not None else None
@@ -350,6 +411,8 @@ class TTNNConv2d(nn.Module):
         # Mesh devices rely on halo exchange; keep sharded layouts and configure fabric instead.
         self._default_shard_layout = shard_layout
         self._active_shard_layout = shard_layout
+        self._shard_layout_override = _env_optional_shard_layout("TTNN_CONV_SHARD_LAYOUT")
+        self._is_depthwise = is_depthwise
 
         # Chunked conv paths rely on host-side slicing; enable only if pre-chunked weights are available.
         self.disable_chunking = False
@@ -365,14 +428,37 @@ class TTNNConv2d(nn.Module):
         self.pw_weight_chunks_prepared = None
         self.pw_bias_chunks_prepared = None
 
+        weights_dtype = _env_optional_ttnn_dtype("TTNN_CONV_WEIGHTS_DTYPE") or self.weight.dtype
         self.conv_config = ttnn.Conv2dConfig(
-            weights_dtype=self.weight.dtype,
+            weights_dtype=weights_dtype,
             activation=conv_activation,
             output_layout=self.layout,
             shard_layout=shard_layout,
         )
         # Store conv config tensors in DRAM to reduce L1_SMALL pressure on large inputs.
         self.conv_config.config_tensors_in_dram = True
+        config_tensors_in_dram = _env_optional_bool("TTNN_CONV_CONFIG_TENSORS_IN_DRAM")
+        if config_tensors_in_dram is not None:
+            self.conv_config.config_tensors_in_dram = config_tensors_in_dram
+        for env_name, attr_name in (
+            ("TTNN_CONV_DEALLOCATE_ACTIVATION", "deallocate_activation"),
+            ("TTNN_CONV_REALLOCATE_HALO_OUTPUT", "reallocate_halo_output"),
+            ("TTNN_CONV_RESHARD_IF_NOT_OPTIMAL", "reshard_if_not_optimal"),
+            ("TTNN_CONV_ENABLE_ACT_DOUBLE_BUFFER", "enable_act_double_buffer"),
+            ("TTNN_CONV_ENABLE_WEIGHTS_DOUBLE_BUFFER", "enable_weights_double_buffer"),
+        ):
+            flag = _env_optional_bool(env_name)
+            if flag is not None and hasattr(self.conv_config, attr_name):
+                setattr(self.conv_config, attr_name, flag)
+        activation_reuse = _env_optional_bool("TTNN_CONV_ENABLE_ACTIVATION_REUSE")
+        if activation_reuse is not None and hasattr(self.conv_config, "enable_activation_reuse"):
+            self.conv_config.enable_activation_reuse = bool(activation_reuse) and self.stride == (1, 1)
+        act_block_h_override = _env_optional_int("TTNN_CONV_ACT_BLOCK_H_OVERRIDE", min_value=0)
+        if act_block_h_override is not None and hasattr(self.conv_config, "act_block_h_override"):
+            self.conv_config.act_block_h_override = act_block_h_override
+        act_block_w_div = _env_optional_int("TTNN_CONV_ACT_BLOCK_W_DIV", min_value=1)
+        if act_block_w_div is not None and hasattr(self.conv_config, "act_block_w_div"):
+            self.conv_config.act_block_w_div = act_block_w_div
 
         # Depthwise stride>1: disable kernel stride folding and tune act block size
         if is_depthwise_strided:
@@ -396,7 +482,33 @@ class TTNNConv2d(nn.Module):
             else:
                 # Enable FP32 for smaller plain convolutions
                 fp32_dest_ok = self.out_channels <= 512 and self.in_channels <= 512
-        math_fidelity = ttnn.MathFidelity.HiFi4
+        conv_fp32_env = os.environ.get("TTNN_CONV_FP32_ACC")
+        if conv_fp32_env is not None:
+            conv_fp32_mode = conv_fp32_env.lower()
+            if conv_fp32_mode in ("0", "off", "none", "false"):
+                fp32_dest_ok = False
+                packer_l1_ok = False
+            elif conv_fp32_mode in ("1", "on", "all", "true"):
+                fp32_dest_ok = True
+                packer_l1_ok = is_depthwise
+            elif conv_fp32_mode in ("depthwise", "dw"):
+                fp32_dest_ok = is_depthwise
+                packer_l1_ok = is_depthwise
+            elif conv_fp32_mode in ("pointwise", "pw"):
+                fp32_dest_ok = self.groups == 1
+                packer_l1_ok = False
+            else:
+                raise ValueError(f"Unsupported TTNN_CONV_FP32_ACC={conv_fp32_env}")
+        math_fidelity_name = os.environ.get("TTNN_MATH_FIDELITY", "HiFi4").strip().lower()
+        math_fidelity_map = {
+            "lofi": ttnn.MathFidelity.LoFi,
+            "hifi2": ttnn.MathFidelity.HiFi2,
+            "hifi3": ttnn.MathFidelity.HiFi3,
+            "hifi4": ttnn.MathFidelity.HiFi4,
+        }
+        if math_fidelity_name not in math_fidelity_map:
+            raise ValueError(f"Unsupported TTNN_MATH_FIDELITY={math_fidelity_name!r}")
+        math_fidelity = math_fidelity_map[math_fidelity_name]
         if not hasattr(ttnn, "init_device_compute_kernel_config"):
             raise RuntimeError("TTNN build is missing init_device_compute_kernel_config; update TTNN.")
         self.compute_config = ttnn.init_device_compute_kernel_config(
@@ -407,11 +519,42 @@ class TTNNConv2d(nn.Module):
         )
         # Prefer precise math by default; allow override via TTNN_MATH_APPROX=1
         if self.compute_config is not None and hasattr(self.compute_config, "math_approx_mode"):
-            self.compute_config.math_approx_mode = False
+            math_approx = _env_optional_bool("TTNN_MATH_APPROX")
+            self.compute_config.math_approx_mode = bool(math_approx) if math_approx is not None else False
+        if (
+            os.environ.get("TTNN_POINTWISE_LINEAR", "0") == "1"
+            and self.kernel_size == (1, 1)
+            and self.stride == (1, 1)
+            and self.pad_hw == (0, 0)
+            and self.dilation == (1, 1)
+            and self.groups == 1
+        ):
+            min_channels = _env_int("TTNN_POINTWISE_LINEAR_MIN_CHANNELS", 0, min_value=0)
+            if max(self.in_channels, self.out_channels) >= min_channels:
+                linear_weight = self.weight_torch[:, :, 0, 0].t().contiguous()
+                self.linear_weight = self.ttnn.from_torch(
+                    linear_weight,
+                    device=self.device,
+                    dtype=self.dtype,
+                    layout=self.ttnn.TILE_LAYOUT,
+                )
+                if self.bias_torch is not None:
+                    self.linear_bias = self.ttnn.from_torch(
+                        self.bias_torch.reshape(1, 1, -1).contiguous(),
+                        device=self.device,
+                        dtype=self.dtype,
+                        layout=self.ttnn.TILE_LAYOUT,
+                    )
+                else:
+                    self.linear_bias = None
+                self.linear_compute_config = self.compute_config
+                self.use_linear = True
         # Output memory config (can be switched to L1 for speed where safe)
         self.memory_config = self.ttnn.DRAM_MEMORY_CONFIG
         # Track whether weights have been prepared on device to avoid reprocessing
         self._weights_prepared = False
+        self._use_torch_conv_fallback = False
+        self._warned_torch_conv_fallback = False
         self.trace_mode = False
 
         # Pointwise chunking and linear fallbacks are intentionally disabled in production.
@@ -421,6 +564,29 @@ class TTNNConv2d(nn.Module):
         # Pre-slice depthwise weights for chunked path when using weight store.
         if self.weight_store is not None and self.weight_key is not None:
             self._init_depthwise_chunks(weight, bias)
+
+    def _select_shard_layout(self, act: TTActivation):
+        override = self._shard_layout_override
+        if override is None:
+            return self._default_shard_layout
+        if override != "auto_shape":
+            return self._default_shard_layout if self._is_depthwise else override
+        if self._is_depthwise:
+            return self._default_shard_layout
+        nhw = max(1, int(act.batch) * int(act.height) * int(act.width))
+        channels = max(1, int(max(self.in_channels, self.out_channels)))
+        if channels > 2 * nhw:
+            return self.ttnn.TensorMemoryLayout.WIDTH_SHARDED
+        if channels * 2 >= nhw:
+            return self.ttnn.TensorMemoryLayout.BLOCK_SHARDED
+        return self.ttnn.TensorMemoryLayout.HEIGHT_SHARDED
+
+    def _update_shard_layout(self, act: TTActivation) -> None:
+        shard_layout = self._select_shard_layout(act)
+        if shard_layout != self._active_shard_layout:
+            self._active_shard_layout = shard_layout
+            if hasattr(self.conv_config, "shard_layout"):
+                self.conv_config.shard_layout = shard_layout
 
     def set_debug_dump(self, name: str, dump_dir: Optional[Path]):
         if dump_dir is None:
@@ -513,47 +679,61 @@ class TTNNConv2d(nn.Module):
         if weight_src is None:
             raise RuntimeError("Depthwise chunk export requires torch weights in save mode.")
         num_chunks = int((self.in_channels + chunk_size - 1) // chunk_size)
+        self.dw_chunk_size = chunk_size
+        self.dw_weight_chunks = []
+        self.dw_bias_chunks = []
         for idx in range(num_chunks):
             c_start = idx * chunk_size
             c_end = min(self.in_channels, c_start + chunk_size)
             w_chunk = weight_src[c_start:c_end, :, :, :]
             w_tt = self.ttnn.from_torch(w_chunk, dtype=self.dtype, layout=self.ttnn.ROW_MAJOR_LAYOUT)
             self.weight_store.save_tensor(f"{self.weight_key}.dw_chunk.{idx}.weight", w_tt)
+            self.dw_weight_chunks.append(w_tt)
             if bias_src is not None:
                 b_chunk = bias_src[c_start:c_end]
                 b_tt = self.ttnn.from_torch(
                     b_chunk.reshape(1, 1, 1, -1), dtype=self.dtype, layout=self.ttnn.ROW_MAJOR_LAYOUT
                 )
                 self.weight_store.save_tensor(f"{self.weight_key}.dw_chunk.{idx}.bias", b_tt)
+            else:
+                b_tt = None
+            self.dw_bias_chunks.append(b_tt)
         self.weight_store.save_meta(meta_key, {"chunk_size": chunk_size, "num_chunks": num_chunks})
 
     def _prepare_weights_once(self, act: TTActivation, x_nhwc):
         """Prepare weights/bias for the current spatial shape to avoid host-side reprocessing."""
         input_mem_cfg = self.ttnn.get_memory_config(x_nhwc)
         input_layout = x_nhwc.get_layout()
-        prepared = self.ttnn.prepare_conv_weights(
-            # prepare on host, then move to device in one shot
-            weight_tensor=self.weight_host,
-            input_memory_config=input_mem_cfg,
-            input_layout=input_layout,
-            weights_format="OIHW",
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            batch_size=act.batch,
-            input_height=act.height,
-            input_width=act.width,
-            kernel_size=self.kernel_size,
-            stride=self.stride,
-            padding=self.pad_hw,
-            dilation=self.dilation,
-            has_bias=self.bias_host is not None,
-            groups=self.groups,
-            device=self.device,
-            input_dtype=self.dtype,
-            output_dtype=self.dtype,
-            conv_config=self.conv_config,
-            compute_config=self.compute_config,
-        )
+        try:
+            prepared = self.ttnn.prepare_conv_weights(
+                # prepare on host, then move to device in one shot
+                weight_tensor=self.weight_host,
+                input_memory_config=input_mem_cfg,
+                input_layout=input_layout,
+                weights_format="OIHW",
+                in_channels=self.in_channels,
+                out_channels=self.out_channels,
+                batch_size=act.batch,
+                input_height=act.height,
+                input_width=act.width,
+                kernel_size=self.kernel_size,
+                stride=self.stride,
+                padding=self.pad_hw,
+                dilation=self.dilation,
+                has_bias=self.bias_host is not None,
+                groups=self.groups,
+                device=self.device,
+                input_dtype=self.dtype,
+                output_dtype=self.dtype,
+                conv_config=self.conv_config,
+                compute_config=self.compute_config,
+            )
+        except Exception:
+            if (not self.trace_mode) and os.environ.get("TTNN_ALLOW_TORCH_CONV_FALLBACK", "1") == "1":
+                self._use_torch_conv_fallback = True
+                self._weights_prepared = True
+                return
+            raise
         if isinstance(prepared, tuple):
             # Some runtimes return (weight, bias); bias may be None if unchanged
             self.weight = prepared[0]
@@ -585,23 +765,69 @@ class TTNNConv2d(nn.Module):
             )
         self._weights_prepared = True
 
+    def _forward_torch_conv_fallback(self, act: TTActivation) -> TTActivation:
+        if not self._warned_torch_conv_fallback:
+            print(
+                "[TTNN] Falling back to Torch for conv "
+                f"in=[N={act.batch},H={act.height},W={act.width},C={act.channels}] "
+                f"weight=[OC={self.out_channels},IC={self.in_channels},K={self.kernel_size},groups={self.groups}]",
+                flush=True,
+            )
+            self._warned_torch_conv_fallback = True
+        x_nhwc = self.ttnn.to_torch(act.tensor).to(torch.float32)
+        x_nchw = x_nhwc.permute(0, 3, 1, 2).contiguous()
+        y_nchw = F.conv2d(
+            x_nchw,
+            self.weight_torch,
+            self.bias_torch,
+            stride=self.stride,
+            padding=self.pad_hw,
+            dilation=self.dilation,
+            groups=self.groups,
+        )
+        y_nhwc = y_nchw.permute(0, 2, 3, 1).contiguous()
+        y_tt = self.ttnn.from_torch(y_nhwc, device=self.device, dtype=self.dtype, layout=self.layout)
+        return TTActivation(y_tt, act.batch, int(y_nhwc.shape[1]), int(y_nhwc.shape[2]), self.out_channels)
+
     def enable_trace_mode(self, enabled: bool = True) -> None:
         self.trace_mode = bool(enabled)
         if self.trace_mode:
-            self.force_tile_input = False
-            self.layout = self.ttnn.ROW_MAJOR_LAYOUT
+            input_layout_mode = os.environ.get("TTNN_TRACE_CONV_INPUT_LAYOUT", "row_major").strip().lower()
+            if input_layout_mode in ("tile", "tiled"):
+                self.force_tile_input = True
+            elif input_layout_mode in ("default", "keep"):
+                self.force_tile_input = self._default_force_tile_input
+            elif input_layout_mode in ("row_major", "row-major", "rm"):
+                self.force_tile_input = False
+            else:
+                raise ValueError(f"Unsupported TTNN_TRACE_CONV_INPUT_LAYOUT={input_layout_mode!r}")
+
+            output_layout_mode = os.environ.get("TTNN_TRACE_CONV_OUTPUT_LAYOUT", "row_major").strip().lower()
+            if output_layout_mode in ("tile", "tiled"):
+                self.layout = self.ttnn.TILE_LAYOUT
+            elif output_layout_mode in ("default", "keep"):
+                self.layout = self._default_layout
+            elif output_layout_mode in ("row_major", "row-major", "rm"):
+                self.layout = self.ttnn.ROW_MAJOR_LAYOUT
+            else:
+                raise ValueError(f"Unsupported TTNN_TRACE_CONV_OUTPUT_LAYOUT={output_layout_mode!r}")
         else:
             self.force_tile_input = self._default_force_tile_input
             self.layout = self._default_layout
+        if hasattr(self, "conv_config") and hasattr(self.conv_config, "output_layout"):
+            self.conv_config.output_layout = self.layout
 
     def forward(self, act: TTActivation) -> TTActivation:
         # Keep inputs TILE in the pipeline, but convert to ROW_MAJOR at the conv call unless explicitly overridden
         x = act
+        self._update_shard_layout(act)
         x_nhwc = _activation_to_nhwc(x)
         desired_layout = self.ttnn.TILE_LAYOUT if self.force_tile_input else self.ttnn.ROW_MAJOR_LAYOUT
         if x_nhwc.get_layout() != desired_layout:
             if self.trace_mode:
-                if x_nhwc.get_layout() not in (self.ttnn.TILE_LAYOUT, self.ttnn.ROW_MAJOR_LAYOUT):
+                if os.environ.get("TTNN_TRACE_CONV_ALIGN", "0") != "0":
+                    x_nhwc = self.ttnn.to_layout(x_nhwc, desired_layout)
+                elif x_nhwc.get_layout() not in (self.ttnn.TILE_LAYOUT, self.ttnn.ROW_MAJOR_LAYOUT):
                     raise RuntimeError("TTNNConv2d trace_mode expects inputs pre-laid-out for conv")
             else:
                 x_nhwc = self.ttnn.to_layout(x_nhwc, desired_layout)
@@ -646,7 +872,12 @@ class TTNNConv2d(nn.Module):
                     if max(act.height, act.width) >= 80 and chunk_size >= 256:
                         chunk_size = 128
             if self.in_channels > chunk_size:
-                out = self._forward_depthwise_chunked(conv_act, x_nhwc, chunk_size)
+                try:
+                    out = self._forward_depthwise_chunked(conv_act, x_nhwc, chunk_size)
+                except Exception:
+                    if (not self.trace_mode) and os.environ.get("TTNN_ALLOW_TORCH_CONV_FALLBACK", "1") == "1":
+                        return self._forward_torch_conv_fallback(conv_act)
+                    raise
                 if pad_extra_h or pad_extra_w:
                     out_tensor = self.ttnn.slice(
                         out.tensor,
@@ -657,7 +888,12 @@ class TTNNConv2d(nn.Module):
                 return out
 
         if (not self.disable_chunking) and self.pointwise_chunk_size and self.in_channels > self.pointwise_chunk_size:
-            out = self._forward_pointwise_chunked(conv_act, x_nhwc, self.pointwise_chunk_size)
+            try:
+                out = self._forward_pointwise_chunked(conv_act, x_nhwc, self.pointwise_chunk_size)
+            except Exception:
+                if (not self.trace_mode) and os.environ.get("TTNN_ALLOW_TORCH_CONV_FALLBACK", "1") == "1":
+                    return self._forward_torch_conv_fallback(conv_act)
+                raise
             if pad_extra_h or pad_extra_w:
                 out_tensor = self.ttnn.slice(
                     out.tensor,
@@ -669,12 +905,12 @@ class TTNNConv2d(nn.Module):
         # Optional linear path for pointwise convs (accuracy-first)
         output_mem_cfg = self._select_output_memory_config(out_height_orig, out_width_orig, act.batch)
         if self.use_linear:
-            if self.trace_mode:
-                if x_nhwc.get_layout() != self.ttnn.TILE_LAYOUT:
+            if x_nhwc.get_layout() != self.ttnn.TILE_LAYOUT:
+                if self.trace_mode and os.environ.get("TTNN_TRACE_CONV_ALIGN", "0") == "0":
                     raise RuntimeError("TTNNConv2d trace_mode expects TILE layout for linear path.")
-                linear_in = x_nhwc
-            else:
                 linear_in = self.ttnn.to_layout(x_nhwc, self.ttnn.TILE_LAYOUT)
+            else:
+                linear_in = x_nhwc
             if self.dtype == self.ttnn.float32:
                 linear_in = self.ttnn.typecast(linear_in, self.ttnn.float32)
             linear_in = self.ttnn.reshape(linear_in, (act.batch, padded_height * padded_width, self.in_channels))
@@ -688,7 +924,7 @@ class TTNNConv2d(nn.Module):
                 linear_out, (act.batch, padded_height, padded_width, self.out_channels)
             )
             if self.layout != output_tensor.get_layout():
-                if self.trace_mode:
+                if self.trace_mode and os.environ.get("TTNN_TRACE_CONV_ALIGN", "0") == "0":
                     raise RuntimeError("TTNNConv2d trace_mode expects linear output in conv layout")
                 output_tensor = self.ttnn.to_layout(output_tensor, self.layout)
             output_tensor = self.ttnn.to_memory_config(output_tensor, output_mem_cfg)
@@ -702,31 +938,37 @@ class TTNNConv2d(nn.Module):
 
         if not self._weights_prepared:
             self._prepare_weights_once(conv_act, x_nhwc)
+        if self._use_torch_conv_fallback:
+            if self.trace_mode:
+                raise RuntimeError("Torch conv fallback is not supported in TTNN trace mode")
+            return self._forward_torch_conv_fallback(conv_act)
         pad_for_conv = self.pad_hw
 
+        conv2d_kwargs = {
+            "input_tensor": x_nhwc,
+            "weight_tensor": self.weight,
+            "bias_tensor": self.bias,  # apply folded bias during convolution
+            "device": self.device,
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "batch_size": x.batch,
+            "input_height": padded_height,
+            "input_width": padded_width,
+            "kernel_size": self.kernel_size,
+            "stride": self.stride,
+            "padding": pad_for_conv,
+            "dilation": self.dilation,
+            "groups": self.groups,
+            "conv_config": self.conv_config,
+            "compute_config": self.compute_config,
+            "memory_config": output_mem_cfg,
+            "return_output_dim": False,
+            "return_weights_and_bias": False,
+            "dtype": self.dtype,
+        }
+
         try:
-            result = self.ttnn.conv2d(
-                input_tensor=x_nhwc,
-                weight_tensor=self.weight,
-                bias_tensor=self.bias,  # apply folded bias during convolution
-                device=self.device,
-                in_channels=self.in_channels,
-                out_channels=self.out_channels,
-                batch_size=x.batch,
-                input_height=padded_height,
-                input_width=padded_width,
-                kernel_size=self.kernel_size,
-                stride=self.stride,
-                padding=pad_for_conv,
-                dilation=self.dilation,
-                groups=self.groups,
-                conv_config=self.conv_config,
-                compute_config=self.compute_config,
-                memory_config=output_mem_cfg,
-                return_output_dim=False,
-                return_weights_and_bias=False,
-                dtype=self.dtype,
-            )
+            result = self.ttnn.conv2d(**conv2d_kwargs)
             # result can be tensor or (tensor, (weights,bias)); keep tensor as NHWC
             if isinstance(result, tuple) and len(result) == 2:
                 output_tensor, meta = result
@@ -745,6 +987,9 @@ class TTNNConv2d(nn.Module):
                 output_tensor = result
 
         except Exception as e:
+            if (not self.trace_mode) and os.environ.get("TTNN_ALLOW_TORCH_CONV_FALLBACK", "1") == "1":
+                self._use_torch_conv_fallback = True
+                return self._forward_torch_conv_fallback(conv_act)
             raise RuntimeError(
                 (
                     "TTNNConv2d failed with shapes: "

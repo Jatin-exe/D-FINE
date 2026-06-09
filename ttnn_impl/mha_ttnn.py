@@ -126,6 +126,13 @@ class TTNNMHA(nn.Module):
         y = ttnn.reshape(y, (b, s, self.num_heads * self.head_dim))
         return y
 
+    def _ensure_sdpa_dtype(self, x_tt):
+        # TTNN SDPA accepts BF16/BFP formats, while the preceding linear path
+        # may produce FLOAT32 when fp32 destination accumulation is enabled.
+        if x_tt.dtype == ttnn.float32:
+            return ttnn.typecast(x_tt, self.dtype)
+        return x_tt
+
     def forward(self, x_q, x_k=None, x_v=None, return_ttnn: bool = True):
         """Forward pass for TTNN tensors only."""
         ttnn = self.ttnn
@@ -157,6 +164,9 @@ class TTNNMHA(nn.Module):
         # Attention (always in TTNN)
         scale = 1.0 / (self.head_dim ** 0.5)
         if self._use_sdpa:
+            q = self._ensure_sdpa_dtype(q)
+            k = self._ensure_sdpa_dtype(k)
+            v = self._ensure_sdpa_dtype(v)
             attn_out = ttnn.transformer.scaled_dot_product_attention(
                 q, k, v, is_causal=False, scale=scale
             )

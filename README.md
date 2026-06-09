@@ -177,6 +177,18 @@ Notes:
 - The evaluation harness uses torch for dataset loading and postprocessing. The model ops themselves are TTNN-only.
 - `run_laser_ttnn_only.sh` defaults to a 10-sample sanity run. Set `FULL_DATASET=1` to evaluate the full split.
 
+#### Current TTNN port checkpoint
+
+The `port/ttnn` checkpoint below was measured on the local Tenstorrent device with `tools/inference/port_coco_subset_benchmark.py`, eval size 640, and the first 10 COCO val2017 images. These numbers are a port sanity benchmark, not a replacement for the official full COCO validation table above.
+
+| Model | Checkpoint | AP@[IoU=0.50:0.95] | AP50 | AP75 | End-to-end latency | Resident trace latency |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| D-FINE-N | COCO | 47.70 | 59.93 | 50.20 | 61.72ms | 27.90ms |
+| D-FINE-S | COCO | 62.90 | 77.08 | 66.56 | 125.92ms | 88.41ms |
+| D-FINE-S | Objects365+COCO | 63.85 | 81.66 | 70.82 | 125.00ms | 88.45ms |
+
+The resident trace number times only repeated execution of an already captured TTNN graph. End-to-end latency includes image loading/preprocessing, host-to-device input copy, trace execution, device-to-host output readback, and postprocessing.
+
 
 ### Data Preparation
 

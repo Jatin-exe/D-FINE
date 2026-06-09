@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import torch
 import torch.nn as nn
 import ttnn
 
@@ -508,9 +509,12 @@ class HybridEncoderTTNN(nn.Module):
             h, w = int(self.eval_spatial_size[0]), int(self.eval_spatial_size[1])
             if h <= 0 or w <= 0:
                 raise ValueError(f"Invalid eval_spatial_size: {(h, w)}")
-            self._pos_embed_ttnn_cache[(w, h)] = self._build_2d_sincos_position_embedding_ttnn(
-                w, h, self.hidden_dim, self.pe_temperature
-            )
+            for enc_ind in self.use_encoder_idx:
+                stride = int(self.feat_strides[enc_ind])
+                feat_w, feat_h = w // stride, h // stride
+                self._pos_embed_ttnn_cache[(feat_w, feat_h)] = self._build_2d_sincos_position_embedding_ttnn(
+                    feat_w, feat_h, self.hidden_dim, self.pe_temperature
+                )
 
 
     def _upsample2x_ttnn_act(self, act: TTActivation) -> TTActivation:
@@ -541,42 +545,16 @@ class HybridEncoderTTNN(nn.Module):
     ):
         """TTNN-only 2D sine-cosine positional embedding (returns TTNN tensor [1, H*W, C])."""
         assert embed_dim % 4 == 0, "Embed dimension must be divisible by 4 for 2D sin-cos position embedding"
-        ttnn = self.ttnn
         pos_dim = embed_dim // 4
-
-        grid_w = ttnn.arange(0, w, 1, device=self.device, dtype=ttnn.float32)
-        grid_h = ttnn.arange(0, h, 1, device=self.device, dtype=ttnn.float32)
-
-        grid_w = ttnn.reshape(grid_w, (w, 1))
-        grid_w = ttnn.repeat(grid_w, (1, h))
-        grid_h = ttnn.reshape(grid_h, (1, h))
-        grid_h = ttnn.repeat(grid_h, (w, 1))
-
-        grid_w = ttnn.reshape(grid_w, (w * h,))
-        grid_h = ttnn.reshape(grid_h, (w * h,))
-
-        omega = ttnn.arange(0, pos_dim, 1, device=self.device, dtype=ttnn.float32)
-        omega = ttnn.div(omega, float(pos_dim))
-        base = ttnn.full((pos_dim,), float(temperature), device=self.device, dtype=ttnn.float32)
-        omega = ttnn.pow(base, omega)
-        omega = ttnn.reciprocal(omega)
-
-        grid_w = ttnn.reshape(grid_w, (w * h, 1))
-        grid_h = ttnn.reshape(grid_h, (w * h, 1))
-        omega = ttnn.reshape(omega, (1, pos_dim))
-
-        grid_w = ttnn.to_layout(grid_w, ttnn.TILE_LAYOUT)
-        grid_h = ttnn.to_layout(grid_h, ttnn.TILE_LAYOUT)
-        omega = ttnn.to_layout(omega, ttnn.TILE_LAYOUT)
-
-        out_w = ttnn.matmul(grid_w, omega)
-        out_h = ttnn.matmul(grid_h, omega)
-
-        pos = ttnn.concat(
-            [ttnn.sin(out_w), ttnn.cos(out_w), ttnn.sin(out_h), ttnn.cos(out_h)], dim=1
-        )
-        pos = ttnn.reshape(pos, (1, w * h, embed_dim))
-        return pos
+        grid_w = torch.arange(int(w), dtype=torch.float32)
+        grid_h = torch.arange(int(h), dtype=torch.float32)
+        grid_w, grid_h = torch.meshgrid(grid_w, grid_h, indexing="ij")
+        omega = torch.arange(pos_dim, dtype=torch.float32) / pos_dim
+        omega = 1.0 / (float(temperature) ** omega)
+        out_w = grid_w.flatten()[..., None] @ omega[None]
+        out_h = grid_h.flatten()[..., None] @ omega[None]
+        pos = torch.concat([out_w.sin(), out_w.cos(), out_h.sin(), out_h.cos()], dim=1)[None, :, :]
+        return self.ttnn.from_torch(pos, device=self.device, dtype=self.cfg.dtype, layout=self.ttnn.TILE_LAYOUT)
 
     def _get_pos_embed_ttnn(self, w: int, h: int) -> "ttnn.Tensor":
         cache = self._pos_embed_ttnn_cache
